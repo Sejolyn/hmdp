@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  web-server:
+    image: nginx:latest
+    container_name: nginx-dev
+    ports:
+      - "8080:80"
+    volumes:
+      # 使用相对路径，./ 表示当前目录下的 html 文件夹
+      - ./html:/usr/share/nginx/html:ro
+    restart: always
