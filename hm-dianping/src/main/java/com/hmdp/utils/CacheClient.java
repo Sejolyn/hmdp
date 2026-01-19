@@ -1,131 +1,502 @@
 package com.hmdp.utils;
 
-import cn.hutool.core.lang.TypeReference;
+import cn.hutool.core.util.IdUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
-import javax.annotation.PostConstruct;
-import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Objects;
 import java.util.concurrent.*;
 import java.util.function.Function;
 
-/**
- * 工业级 Redis 缓存客户端
- * <p>
- * 核心特性：
- * <ul>
- *   <li>三种缓存策略：穿透防护、互斥锁、逻辑过期</li>
- *   <li>缓存雪崩防护：随机过期时间</li>
- *   <li>高性能：异步重建、线程池复用</li>
- *   <li>高可用：优雅降级、异常隔离</li>
- *   <li>可观测：详细日志、性能指标</li>
- *   <li>可扩展：策略模式、泛型设计</li>
- * </ul>
- *
- * @author sejolyn
- * @version 2.0
- * @since 2026-01-19
- */
 @Slf4j
 @Component
 public class CacheClient {
 
-    /**
-     * 默认空值缓存时间
-     */
-    private static final Duration DEFAULT_NULL_TTL = Duration.ofMinutes(2);
-
-    /**
-     * 默认随机因子
-     */
+    // 线程池核心线程数
+    private static final int CORE_POOL_SIZE = Runtime.getRuntime().availableProcessors();
+    // 线程池最大线程数
+    private static final int MAX_POOL_SIZE = CORE_POOL_SIZE * 2;
+    // 线程池队列容量
+    private static final int QUEUE_CAPACITY = 1000;
+    // 线程池线程空闲存活时间
+    private static final long KEEP_ALIVE_TIME = 60L;
+    // 获取互斥锁的最大重试次数
+    private static final int MAX_RETRY_COUNT = 100;
+    // 默认随机因子，防止缓存雪崩
     private static final double DEFAULT_RANDOM_FACTOR = 0.1;
 
-    /**
-     * 默认锁重试次数
-     */
-    private static final int DEFAULT_LOCK_RETRY_TIMES = 3;
+    // 锁释放脚本
+    private static final DefaultRedisScript<Long> UNLOCK_SCRIPT;
 
-    /**
-     * 默认锁重试间隔（毫秒）
-     */
-    private static final long DEFAULT_LOCK_RETRY_INTERVAL = 50;
-
-    /**
-     * 线程池核心线程数
-     */
-    private static final int CORE_POOL_SIZE = Runtime.getRuntime().availableProcessors();
-
-    /**
-     * 线程池最大线程数
-     */
-    private static final int MAX_POOL_SIZE = CORE_POOL_SIZE * 2;
-
-    /**
-     * 线程池队列容量
-     */
-    private static final int QUEUE_CAPACITY = 1000;
-
-    /**
-     * 线程池空闲超时时间
-     */
-    private static final long KEEP_ALIVE_TIME = 60L;
-
-    /**
-     * 线程池关闭超时时间
-     */
-    private static final long SHUTDOWN_TIMEOUT = 30L;
-
+    static {
+        UNLOCK_SCRIPT = new DefaultRedisScript<>();
+        UNLOCK_SCRIPT.setLocation(new ClassPathResource("lua/unlock.lua"));
+        UNLOCK_SCRIPT.setResultType(Long.class);
+    }
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
-    /**
-     * 缓存重建线程池
-     * 使用有界队列防止OOM，使用CallerRunsPolicy保证任务不丢失
-     */
     private final ExecutorService cacheRebuildExecutor;
-
-    /**
-     * 锁释放脚本：保证原子性（比较+删除）
-     * 防止误删其他线程的锁
-     */
-    private static final DefaultRedisScript<Long> UNLOCK_SCRIPT = new DefaultRedisScript<>();
-
-    static {
-        UNLOCK_SCRIPT.setLocation(new org.springframework.core.io.ClassPathResource("lua/unlock.lua"));
-        UNLOCK_SCRIPT.setResultType(Long.class);
-    }
 
     public CacheClient() {
         this.cacheRebuildExecutor = createThreadPool();
     }
 
     /**
-     * 创建优化的线程池
+     * 创建自定义线程池
      */
-    private ThreadPoolExecutor createThreadPool() {
+    private ExecutorService createThreadPool() {
         return new ThreadPoolExecutor(
                 CORE_POOL_SIZE,
                 MAX_POOL_SIZE,
                 KEEP_ALIVE_TIME,
                 TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(QUEUE_CAPACITY),
+                new LinkedBlockingQueue<>(),
                 new CacheRebuildThreadFactory(),
                 new ThreadPoolExecutor.CallerRunsPolicy()
         );
     }
 
     /**
-     * 自定义线程工厂：设置线程名称和守护线程
+     * 通过缓存空值解决缓存穿透的查询方法
+     *
+     * @param keyPrefix  缓存key前缀
+     * @param id         数据id
+     * @param clazz      数据类型
+     * @param ttl        缓存过期时间
+     * @param dbFallback 数据库查询函数
+     * @return 查询结果
+     */
+    public <ID, T> T queryWithPassThrough(
+            String keyPrefix,
+            ID id,
+            Class<T> clazz,
+            Duration ttl,
+            Function<ID, T> dbFallback
+    ) {
+        // 参数校验
+        validateParams(keyPrefix, id, clazz, ttl, dbFallback);
+        String key = buildKey(keyPrefix, id);
+
+        // 1. 查询缓存
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (StrUtil.isNotBlank(json)) {
+            // 缓存命中，反序列化并返回
+            return JSONUtil.toBean(json, clazz);
+        }
+        if (json != null) {
+            // 说明是之前缓存的空值，返回null
+            return null;
+        }
+
+        // 2. 缓存不存在，查询数据库
+        T data = executeWithFallback(dbFallback, id);
+        if (data == null) {
+            // 数据库不存在，缓存空值防止缓存穿透
+            stringRedisTemplate.opsForValue().set(key, "", Duration.ofMinutes(2));
+            return null;
+        }
+
+        // 3. 数据库存在，写入缓存
+        set(key, data, ttl, DEFAULT_RANDOM_FACTOR);
+        return data;
+    }
+
+    /**
+     * 通过缓存空值解决缓存穿透的查询方法（List集合版本）
+     *
+     * @param keyPrefix  缓存key前缀
+     * @param id         数据id (如果没有id可以传空字符串)
+     * @param clazz      集合元素类型
+     * @param ttl        缓存过期时间
+     * @param dbFallback 数据库查询函数
+     * @return 查询结果
+     */
+    public <ID, T> java.util.List<T> queryListWithPassThrough(
+            String keyPrefix,
+            ID id,
+            Class<T> clazz,
+            Duration ttl,
+            Function<ID, java.util.List<T>> dbFallback
+    ) {
+        // 参数校验
+        Objects.requireNonNull(keyPrefix, "keyPrefix must not be null");
+        Objects.requireNonNull(clazz, "clazz must not be null");
+        Objects.requireNonNull(ttl, "ttl must not be null");
+        Objects.requireNonNull(dbFallback, "dbFallback must not be null");
+        
+        String key = buildKey(keyPrefix, id);
+
+        // 1. 查询缓存
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (StrUtil.isNotBlank(json)) {
+            // 缓存命中，反序列化并返回
+            return JSONUtil.toList(json, clazz);
+        }
+        if (json != null) {
+            // 说明是之前缓存的空值，返回空集合
+            return Collections.emptyList();
+        }
+
+        // 2. 缓存不存在，查询数据库
+        java.util.List<T> data = executeWithFallback(dbFallback, id);
+        if (data == null || data.isEmpty()) {
+            // 数据库不存在，缓存空值防止缓存穿透
+            stringRedisTemplate.opsForValue().set(key, "", Duration.ofMinutes(2));
+            return Collections.emptyList();
+        }
+
+        // 3. 数据库存在，写入缓存
+        set(key, data, ttl, DEFAULT_RANDOM_FACTOR);
+        return data;
+    }
+
+    /**
+     * 设置缓存值并指定过期时间
+     *
+     * @param key          缓存key
+     * @param value        缓存值
+     * @param baseDuration 基础过期时间
+     * @param randomFactor 随机因子（如0.2表示±20%的随机范围）
+     */
+    public void set(String key, Object value, Duration baseDuration, double randomFactor) {
+        validateKey(key);
+        Objects.requireNonNull(baseDuration, "baseDuration不能为null");
+
+        Duration ttl = addRandomness(baseDuration, randomFactor);
+        set(key, value, ttl);
+    }
+
+    /**
+     * 设置缓存值并指定过期时间
+     *
+     * @param key   缓存key
+     * @param value 缓存值
+     * @param ttl   过期时间
+     */
+     public void set(String key, Object value, Duration ttl) {
+        validateKey(key);
+        Objects.requireNonNull(ttl, "ttl不能为null");
+
+        try {
+            String json = JSONUtil.toJsonStr(value);
+            stringRedisTemplate.opsForValue().set(key, json, ttl);
+        } catch (Exception e) {
+            log.error("缓存写入失败，key：{}", key, e);
+            throw new CacheException("缓存写入失败", e);
+        }
+    }
+
+    /**
+     * 为基础过期时间添加随机量，防止缓存雪崩
+     *
+     * @param baseDuration 基础过期时间
+     * @param randomFactor 随机因子（如0.2表示±20%的随机范围）
+     * @return 添加随机量后的过期时间
+     */
+    private Duration addRandomness(Duration baseDuration, double randomFactor) {
+        if (randomFactor <= 0) {
+            return baseDuration;
+        }
+        long baseMillis = baseDuration.toMillis();
+        long randomRange = (long) (baseMillis * randomFactor);
+        // 生成[-randomRange, +randomRange]范围内的随机数
+        long randomMillis = (long) (Math.random() * randomRange * 2 - randomRange);
+        return Duration.ofMillis(baseMillis + randomMillis);
+    }
+
+    /**
+     * 通过互斥锁解决缓存击穿的查询方法
+     *
+     * @param keyPrefix  缓存key前缀
+     * @param lockPrefix 互斥锁key前缀
+     * @param id         数据id
+     * @param clazz      数据类型
+     * @param ttl        缓存过期时间
+     * @param lockTtl    互斥锁过期时间
+     * @param dbFallback 数据库查询函数
+     * @return 查询结果
+     */
+    public <ID, T> T queryWithMutex(
+            String keyPrefix,
+            String lockPrefix,
+            ID id,
+            Class<T> clazz,
+            Duration ttl,
+            Duration lockTtl,
+            Function<ID, T> dbFallback
+    ) {
+        // 参数校验
+        validateParams(keyPrefix, id, clazz, ttl, dbFallback);
+        Objects.requireNonNull(lockPrefix, "lockPrefix must not be null");
+        Objects.requireNonNull(lockTtl, "lockTtl must not be null");
+
+        String key = buildKey(keyPrefix, id);
+
+        // 1. 查询缓存
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (StrUtil.isNotBlank(json)) {
+            // 缓存命中，刷新TTL后返回
+            stringRedisTemplate.expire(key, ttl);
+            return JSONUtil.toBean(json, clazz);
+        }
+        if (json != null) {
+            // 说明是之前缓存的空值，返回null
+            return null;
+        }
+
+        // 2. 缓存不存在，尝试获取互斥锁
+        String lockKey = buildKey(lockPrefix, id);
+        String lockId = IdUtil.simpleUUID();
+        T data = null;
+        int retryCount = 0;
+        while (retryCount < MAX_RETRY_COUNT) {
+            // 尝试获取互斥锁
+            if (tryLock(lockKey, lockId, lockTtl)) {
+                try {
+                    // Double Check：获取锁成功后，再次检查缓存是否已被其他线程更新
+                    json = stringRedisTemplate.opsForValue().get(key);
+                    if (StrUtil.isNotBlank(json)) {
+                        // 缓存已经被更新，刷新TTL后返回
+                        stringRedisTemplate.expire(key, ttl);
+                        return JSONUtil.toBean(json, clazz);
+                    }
+                    if (json != null) {
+                        // 说明是之前缓存的空值，返回null
+                        return null;
+                    }
+
+                    // 缓存未被更新，查询数据库
+                    data = executeWithFallback(dbFallback, id);
+                    if (data == null) {
+                        // 数据库不存在，缓存空值防止缓存穿透
+                        stringRedisTemplate.opsForValue().set(key, "", Duration.ofMinutes(2));
+                        return null;
+                    }
+
+                    // 数据库存在，写入缓存
+                    set(key, data, ttl, DEFAULT_RANDOM_FACTOR);
+                    return data;
+                } finally {
+                    // 释放锁
+                    unlock(lockKey, lockId);
+                }
+            }
+
+            // 获取锁失败，休眠并重试
+            retryCount++;
+            if (retryCount < MAX_RETRY_COUNT) {
+                try {
+                    // 等待50毫秒后重试
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    // 恢复中断状态
+                    Thread.currentThread().interrupt();
+                    throw new CacheException("线程被中断", e);
+                }
+            }
+        }
+
+        // 兜底方案：重试多次仍未获取锁，直接查询数据库
+        // 说明系统压力极大，为了不让用户等太久，直接查询数据库
+        data = executeWithFallback(dbFallback, id);
+        if (data != null) {
+            // 写入缓存
+            set(key, data, ttl, DEFAULT_RANDOM_FACTOR);
+        }
+        return data;
+    }
+
+    /**
+     * 反序列化JSON字符串为指定类型对象
+     */
+    private <T> T deserialize(String json, Class<T> clazz) {
+        try {
+            return JSONUtil.toBean(json, clazz);
+        } catch (Exception e) {
+            log.error("缓存反序列化失败，json：{}, class：{}", json, clazz.getName(), e);
+            return null;
+        }
+    }
+
+    /**
+     * 带逻辑过期时间的缓存查询（解决缓存击穿）
+     *
+     * @param keyPrefix  缓存key前缀
+     * @param lockPrefix 互斥锁key前缀
+     * @param id         数据id
+     * @param clazz      数据类型
+     * @param ttl        逻辑过期时间
+     * @param lockTtl    互斥锁过期时间
+     * @param dbFallback 数据库查询函数
+     * @return 查询结果
+     */
+    public <ID, T> T queryWithLogicalExpire (
+            String keyPrefix,
+            String lockPrefix,
+            ID id,
+            Class<T> clazz,
+            Duration ttl,
+            Duration lockTtl,
+            Function<ID, T> dbFallback
+    ) {
+        // 参数校验
+        validateParams(keyPrefix, id, clazz, ttl, dbFallback);
+        Objects.requireNonNull(lockPrefix, "lockPrefix must not be null");
+        Objects.requireNonNull(lockTtl, "lockTtl must not be null");
+
+        String key = buildKey(keyPrefix, id);
+
+        // 1. 查询缓存
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (StrUtil.isBlank(json)) {
+            // 缓存不存在，首次查询或缓存被删除，同步回源
+            T data = executeWithFallback(dbFallback, id);
+            if (data != null) {
+                saveWithLogicalExpire(key, data, ttl);
+            }
+            return data;
+        }
+
+        // 2. 缓存命中，反序列化为RedisData
+        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+        LocalDateTime expireTime = redisData.getExpireTime();
+        T data = JSONUtil.toBean(JSONUtil.parseObj(redisData.getData()), clazz);
+
+        // 3. 判断是否过期
+        if (expireTime.isAfter(LocalDateTime.now())) {
+            // 未过期，直接返回数据
+            return data;
+        }
+
+        // 4. 已过期，尝试获取互斥锁
+        String lockKey = buildKey(lockPrefix, id);
+        String lockId = IdUtil.simpleUUID();
+        if (tryLock(lockKey, lockId, lockTtl)) {
+            // Double Check：获取锁成功后，再次检查缓存是否已被其他线程更新
+            json = stringRedisTemplate.opsForValue().get(key);
+            if (StrUtil.isNotBlank(json)) {
+                redisData = JSONUtil.toBean(json, RedisData.class);
+                // 如果缓存已经被更新（未过期），刷新逻辑过期时间，然后返回
+                if (redisData.getExpireTime().isAfter(LocalDateTime.now())) {
+                    // 更新逻辑过期时间
+                    data = JSONUtil.toBean(JSONUtil.toJsonStr(redisData.getData()), clazz);
+                    saveWithLogicalExpire(key, data, ttl);
+                    unlock(lockKey, lockId); // 释放锁
+                    return data;
+                }
+            }
+
+            // 5. 获取锁成功，异步构建缓存
+            cacheRebuildExecutor.submit(() -> {
+                try {
+                    // 查询数据库
+                    T t = executeWithFallback(dbFallback, id);
+                    if (t != null) {
+                        // 写入缓存
+                        this.saveWithLogicalExpire(key, t, ttl);
+                    }
+                } catch (Exception e) {
+                    // 记录日志，避免异常丢失
+                    log.error("缓存重建失败，key：{}", key, e);
+                } finally {
+                    // 释放锁
+                    unlock(lockKey, lockId);
+                }
+            });
+        }
+
+        // 6. 返回过期的缓存数据
+        return data;
+    }
+
+    /**
+     * 释放互斥锁
+     */
+    private void unlock(String key, String lockId) {
+        // 使用 Lua 脚本保证释放锁的原子性
+        stringRedisTemplate.execute(
+                UNLOCK_SCRIPT,
+                Collections.singletonList(key),
+                lockId
+        );
+    }
+
+    /**
+     * 尝试获取互斥锁
+     */
+    private boolean tryLock(String key, String lockId, Duration ttl) {
+        try {
+            Boolean success = stringRedisTemplate.opsForValue().setIfAbsent(key, lockId, ttl);
+            return Boolean.TRUE.equals(success);
+        } catch (Exception e) {
+            log.error("获取互斥锁失败，key：{}", key, e);
+            return false;
+        }
+    }
+
+    /**
+     * 带逻辑过期时间的缓存写入
+     */
+    private <T> void saveWithLogicalExpire(String key, T data, Duration ttl) {
+        try {
+            // 1. 封装RedisData
+            RedisData redisData = new RedisData();
+            redisData.setData(data);
+            redisData.setExpireTime(LocalDateTime.now().plus(ttl));
+
+            // 2. 写入Redis
+            stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
+        } catch (Exception e) {
+            log.error("缓存写入失败，key：{}", key, e);
+            throw new CacheException("缓存写入失败", e);
+        }
+    }
+
+    /**
+     * 参数校验
+     */
+    private <ID, T> void validateParams(String keyPrefix, ID id, Class<T> clazz, Duration ttl, Function<ID, T> dbFallback) {
+        Objects.requireNonNull(keyPrefix, "keyPrefix must not be null");
+        Objects.requireNonNull(id, "id must not be null");
+        Objects.requireNonNull(clazz, "clazz must not be null");
+        Objects.requireNonNull(ttl, "ttl must not be null");
+        Objects.requireNonNull(dbFallback, "dbFallback must not be null");
+    }
+
+    /**
+     * 构建缓存key
+     */
+    private <ID> String buildKey(String keyPrefix, ID id) {
+        return keyPrefix + id;
+    }
+
+    /**
+     * 执行数据库查询并处理异常
+     */
+    private <ID, T> T executeWithFallback(Function<ID, T> dbFallback, ID id) {
+        try {
+            return dbFallback.apply(id);
+        } catch (Exception e) {
+            log.debug("数据库查询失败，id：{}", id, e);
+            throw new CacheException("数据库查询失败", e);
+        }
+    }
+
+    /**
+     * 自定义线程工厂，设置线程为守护线程并命名
      */
     private static class CacheRebuildThreadFactory implements ThreadFactory {
         private final ThreadFactory defaultFactory = Executors.defaultThreadFactory();
@@ -134,587 +505,65 @@ public class CacheClient {
         @Override
         public Thread newThread(Runnable r) {
             Thread thread = defaultFactory.newThread(r);
-            thread.setName("cache-rebuild-" + counter++);
             thread.setDaemon(true);
+            thread.setName("cache-rebuild-thread-" + counter++);
             return thread;
         }
     }
 
     /**
-     * 初始化回调
-     */
-    @PostConstruct
-    public void init() {
-        ThreadPoolExecutor executor = (ThreadPoolExecutor) cacheRebuildExecutor;
-        log.info("CacheClient 初始化完成 - 核心线程数: {}, 最大线程数: {}, 队列容量: {}",
-                executor.getCorePoolSize(),
-                executor.getMaximumPoolSize(),
-                QUEUE_CAPACITY);
-    }
-
-    /**
-     * 销毁回调：优雅关闭线程池
-     */
-    @PreDestroy
-    public void destroy() {
-        log.info("CacheClient 开始关闭线程池...");
-        shutdownThreadPool();
-        log.info("CacheClient 线程池已关闭");
-    }
-
-    /**
-     * 优雅关闭线程池
-     */
-    private void shutdownThreadPool() {
-        cacheRebuildExecutor.shutdown();
-        try {
-            if (!cacheRebuildExecutor.awaitTermination(SHUTDOWN_TIMEOUT, TimeUnit.SECONDS)) {
-                log.warn("线程池未能在 {} 秒内关闭，强制关闭...", SHUTDOWN_TIMEOUT);
-                cacheRebuildExecutor.shutdownNow();
-
-                if (!cacheRebuildExecutor.awaitTermination(SHUTDOWN_TIMEOUT, TimeUnit.SECONDS)) {
-                    log.error("线程池强制关闭失败");
-                }
-            }
-        } catch (InterruptedException e) {
-            log.error("关闭线程池被中断", e);
-            cacheRebuildExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
-        }
-    }
-
-    /**
-     * 获取线程池状态（用于监控）
-     */
-    public String getThreadPoolStatus() {
-        if (cacheRebuildExecutor instanceof ThreadPoolExecutor executor) {
-            return String.format(
-                    "活跃线程: %d, 池大小: %d, 队列大小: %d, 完成任务: %d",
-                    executor.getActiveCount(),
-                    executor.getPoolSize(),
-                    executor.getQueue().size(),
-                    executor.getCompletedTaskCount()
-            );
-        }
-        return "Unknown";
-    }
-
-    /**
-     * 设置缓存（带随机过期时间，防止雪崩）
+     * 预热缓存（用于逻辑过期策略）
      *
-     * @param key          键
-     * @param value        值
-     * @param baseDuration 基础过期时间
-     * @param randomFactor 随机因子（如 0.1 表示 ±10% 波动）
-     */
-    public void set(String key, Object value, Duration baseDuration, double randomFactor) {
-        validateKey(key);
-        Objects.requireNonNull(baseDuration, "baseDuration must not be null");
-
-        Duration ttl = addRandomness(baseDuration, randomFactor);
-        set(key, value, ttl);
-    }
-
-    /**
-     * 设置缓存
-     *
-     * @param key   键
-     * @param value 值
-     * @param ttl   过期时间
-     */
-    public void set(String key, Object value, Duration ttl) {
-        validateKey(key);
-        Objects.requireNonNull(ttl, "ttl must not be null");
-
-        try {
-            String jsonValue = JSONUtil.toJsonStr(value);
-            stringRedisTemplate.opsForValue().set(key, jsonValue, ttl);
-        } catch (Exception e) {
-            log.error("设置缓存失败, key: {}", key, e);
-            throw new CacheException("Failed to set cache", e);
-        }
-    }
-
-    /**
-     * 获取缓存
-     *
-     * @param key   键
-     * @param clazz 类型
-     * @return 缓存值
-     */
-    public <T> T get(String key, Class<T> clazz) {
-        validateKey(key);
-        Objects.requireNonNull(clazz, "clazz must not be null");
-
-        try {
-            String json = stringRedisTemplate.opsForValue().get(key);
-            if (StrUtil.isBlank(json)) {
-                return null;
-            }
-            return JSONUtil.toBean(json, clazz);
-        } catch (Exception e) {
-            log.error("获取缓存失败, key: {}", key, e);
-            return null;
-        }
-    }
-
-    /**
-     * 删除缓存
-     *
-     * @param key 键
-     * @return 是否删除成功
-     */
-    public boolean delete(String key) {
-        validateKey(key);
-
-        try {
-            return stringRedisTemplate.delete(key);
-        } catch (Exception e) {
-            log.error("删除缓存失败, key: {}", key, e);
-            return false;
-        }
-    }
-
-    /**
-     * 判断键是否存在
-     *
-     * @param key 键
-     * @return 是否存在
-     */
-    public boolean exists(String key) {
-        validateKey(key);
-
-        try {
-            return stringRedisTemplate.hasKey(key);
-        } catch (Exception e) {
-            log.error("判断缓存存在失败, key: {}", key, e);
-            return false;
-        }
-    }
-
-    /**
-     * 批量删除缓存
-     *
-     * @param keys 键集合
-     * @return 删除数量
-     */
-    public long deleteMulti(String... keys) {
-        if (keys == null || keys.length == 0) {
-            return 0;
-        }
-
-        try {
-            return stringRedisTemplate.delete(java.util.Arrays.asList(keys));
-        } catch (Exception e) {
-            log.error("批量删除缓存失败", e);
-            return 0;
-        }
-    }
-
-    // ==================== 缓存穿透策略：空值缓存 ====================
-
-    /**
-     * 查询缓存（解决缓存穿透：空值缓存方案）
-     * <p>
-     * 适用场景：数据量适中，对一致性要求不高，可能存在恶意查询不存在的数据
-     * <p>
-     * 工作原理：
-     * 1. 查询缓存，命中直接返回
-     * 2. 未命中查询数据库
-     * 3. 数据库不存在则缓存空值（防止穿透）
-     * 4. 数据库存在则缓存真实值
-     *
-     * @param keyPrefix  key 前缀
-     * @param id         id
-     * @param clazz      返回类型
-     * @param ttl        缓存过期时间
-     * @param dbFallback 数据库查询函数
-     * @param <T>        返回类型
-     * @param <ID>       id 类型
-     * @return 查询结果
-     */
-    public <T, ID> T queryWithPassThrough(
-            String keyPrefix,
-            ID id,
-            Class<T> clazz,
-            Duration ttl,
-            Function<ID, T> dbFallback) {
-
-        validateParams(keyPrefix, id, clazz, ttl, dbFallback);
-        String key = buildKey(keyPrefix, id);
-
-        long startTime = System.currentTimeMillis();
-        try {
-            // 1. 从 Redis 查询
-            String json = stringRedisTemplate.opsForValue().get(key);
-            if (StrUtil.isNotBlank(json)) {
-                logCacheHit(key, startTime);
-                return deserialize(json, clazz);
-            }
-
-            // 2. 命中空值缓存
-            if (json != null) {
-                logCacheHit(key + " (null)", startTime);
-                return null;
-            }
-
-            // 3. 未命中，查询数据库
-            logCacheMiss(key, startTime);
-            T data = executeWithFallback(dbFallback, id, key);
-
-            if (data == null) {
-                // 数据库不存在，缓存空值防止穿透
-                cacheNullValue(key, DEFAULT_NULL_TTL);
-                return null;
-            }
-
-            // 4. 写入缓存（带随机过期时间，防止雪崩）
-            set(key, data, ttl, DEFAULT_RANDOM_FACTOR);
-            return data;
-
-        } catch (Exception e) {
-            log.error("缓存穿透查询失败, key: {}", key, e);
-            // 降级：直接查询数据库
-            return dbFallback.apply(id);
-        }
-    }
-
-    // ==================== 缓存击穿策略：互斥锁 ====================
-
-    /**
-     * 查询缓存（解决缓存击穿：互斥锁方案）
-     * <p>
-     * 适用场景：数据一致性要求高，并发量不高，可以接受短暂的阻塞等待
-     * <p>
-     * 工作原理：
-     * 1. 查询缓存，命中直接返回
-     * 2. 未命中尝试获取互斥锁
-     * 3. 获取锁成功：Double Check + 查DB + 写缓存
-     * 4. 获取锁失败：重试或降级查DB
-     *
-     * @param keyPrefix  key 前缀
-     * @param lockPrefix 锁 key 前缀
-     * @param id         id
-     * @param clazz      返回类型
-     * @param ttl        缓存过期时间
-     * @param lockTtl    锁过期时间
-     * @param dbFallback 数据库查询函数
-     * @param <T>        返回类型
-     * @param <ID>       id 类型
-     * @return 查询结果
-     */
-    public <T, ID> T queryWithMutex(
-            String keyPrefix,
-            String lockPrefix,
-            ID id,
-            Class<T> clazz,
-            Duration ttl,
-            Duration lockTtl,
-            Function<ID, T> dbFallback) {
-
-        validateParams(keyPrefix, id, clazz, ttl, dbFallback);
-        Objects.requireNonNull(lockPrefix, "lockPrefix must not be null");
-        Objects.requireNonNull(lockTtl, "lockTtl must not be null");
-
-        String key = buildKey(keyPrefix, id);
-        String lockKey = buildKey(lockPrefix, id);
-
-        long startTime = System.currentTimeMillis();
-
-        // 1. 查询缓存
-        T cachedData = getFromCache(key, clazz);
-        if (cachedData != null) {
-            logCacheHit(key, startTime);
-            return cachedData;
-        }
-
-        // 2. 获取互斥锁
-        String lockValue = generateLockValue();
-        try {
-            if (!acquireLock(lockKey, lockValue, lockTtl)) {
-                // 获取锁失败，降级处理
-                log.warn("获取锁失败，降级直接查询数据库, key: {}", key);
-                return dbFallback.apply(id);
-            }
-
-            // 3. Double Check 缓存
-            cachedData = getFromCache(key, clazz);
-            if (cachedData != null) {
-                log.info("Double Check 缓存命中, key: {}", key);
-                return cachedData;
-            }
-
-            // 4. 查询数据库
-            logCacheMiss(key, startTime);
-            T data = executeWithFallback(dbFallback, id, key);
-
-            if (data == null) {
-                cacheNullValue(key, DEFAULT_NULL_TTL);
-                return null;
-            }
-
-            // 5. 写入缓存
-            set(key, data, ttl, DEFAULT_RANDOM_FACTOR);
-            return data;
-
-        } catch (Exception e) {
-            log.error("互斥锁查询失败, key: {}", key, e);
-            return dbFallback.apply(id);
-        } finally {
-            // 6. 释放锁
-            releaseLock(lockKey, lockValue);
-        }
-    }
-
-    /**
-     * 获取互斥锁（带重试）
-     */
-    private boolean acquireLock(String lockKey, String lockValue, Duration lockTtl) {
-        for (int i = 0; i < DEFAULT_LOCK_RETRY_TIMES; i++) {
-            if (tryLock(lockKey, lockValue, lockTtl)) {
-                return true;
-            }
-
-            if (i < DEFAULT_LOCK_RETRY_TIMES - 1) {
-                try {
-                    TimeUnit.MILLISECONDS.sleep(DEFAULT_LOCK_RETRY_INTERVAL);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    log.warn("获取锁被中断, lockKey: {}", lockKey);
-                    return false;
-                }
-            }
-        }
-        return false;
-    }
-
-    /**
-     * 查询缓存（解决缓存击穿：逻辑过期方案）
-     *
-     * @param keyPrefix  key 前缀
-     * @param lockPrefix 锁 key 前缀
-     * @param id         id
-     * @param clazz      返回类型
-     * @param ttl        逻辑过期时间
-     * @param lockTtl    锁过期时间
-     * @param dbFallback 数据库查询函数
-     * @param <T>        返回类型
-     * @param <ID>       id 类型
-     * @return 查询结果
-     */
-    public <T, ID> T queryWithLogicalExpire(
-            String keyPrefix,
-            String lockPrefix,
-            ID id,
-            Class<T> clazz,
-            Duration ttl,
-            Duration lockTtl,
-            Function<ID, T> dbFallback) {
-
-        validateParams(keyPrefix, id, clazz, ttl, dbFallback);
-        Objects.requireNonNull(lockPrefix, "lockPrefix must not be null");
-        Objects.requireNonNull(lockTtl, "lockTtl must not be null");
-
-        String key = buildKey(keyPrefix, id);
-        long startTime = System.currentTimeMillis();
-
-        try {
-            // 1. 查询缓存
-            String json = stringRedisTemplate.opsForValue().get(key);
-            if (StrUtil.isBlank(json)) {
-                // 缓存不存在，首次查询或缓存被删除，同步回源
-                logCacheMiss(key, startTime);
-                T data = executeWithFallback(dbFallback, id, key);
-                if (data != null) {
-                    saveWithLogicalExpire(key, data, ttl);
-                }
-                return data;
-            }
-
-            // 2. 反序列化为 RedisData
-            RedisData redisData = JSONUtil.toBean(json, RedisData.class);
-            T data = deserializeRedisData(json, clazz);
-            LocalDateTime expireTime = redisData.getExpireTime();
-
-            // 3. 判断是否过期
-            if (expireTime.isAfter(LocalDateTime.now())) {
-                // 未过期，直接返回
-                logCacheHit(key, startTime);
-                return data;
-            }
-
-            // 4. 已过期，尝试异步重建
-            String lockKey = buildKey(lockPrefix, id);
-            asyncRebuildCache(lockKey, key, id, ttl, lockTtl, dbFallback);
-
-            // 返回过期数据（保证高性能）
-            log.debug("返回过期数据，异步重建中, key: {}", key);
-            return data;
-
-        } catch (Exception e) {
-            log.error("逻辑过期查询失败, key: {}", key, e);
-            // 降级：直接查询数据库
-            return dbFallback.apply(id);
-        }
-    }
-
-    /**
-     * 异步重建缓存
-     */
-    private <T, ID> void asyncRebuildCache(
-            String lockKey,
-            String cacheKey,
-            ID id,
-            Duration ttl,
-            Duration lockTtl,
-            Function<ID, T> dbFallback) {
-
-        String lockValue = generateLockValue();
-
-        if (!tryLock(lockKey, lockValue, lockTtl)) {
-            // 获取锁失败，说明其他线程正在重建
-            log.debug("其他线程正在重建缓存, key: {}", cacheKey);
-            return;
-        }
-
-        // 获取锁成功，提交异步任务
-        log.info("开始异步重建缓存, key: {}", cacheKey);
-        cacheRebuildExecutor.submit(() -> rebuildCacheTask(lockKey, lockValue, cacheKey, id, ttl, dbFallback));
-    }
-
-    /**
-     * 重建缓存任务
-     */
-    private <T, ID> void rebuildCacheTask(
-            String lockKey,
-            String lockValue,
-            String cacheKey,
-            ID id,
-            Duration ttl,
-            Function<ID, T> dbFallback) {
-
-        long startTime = System.currentTimeMillis();
-        try {
-            // Double Check：检查是否已被其他线程重建
-            String json = stringRedisTemplate.opsForValue().get(cacheKey);
-            if (StrUtil.isNotBlank(json)) {
-                RedisData redisData = JSONUtil.toBean(json, RedisData.class);
-                if (redisData.getExpireTime().isAfter(LocalDateTime.now())) {
-                    log.debug("缓存已被其他线程重建, key: {}", cacheKey);
-                    return;
-                }
-            }
-
-            // 查询数据库并重建缓存
-            T data = dbFallback.apply(id);
-            if (data != null) {
-                saveWithLogicalExpire(cacheKey, data, ttl);
-                long cost = System.currentTimeMillis() - startTime;
-                log.info("缓存重建成功, key: {}, 耗时: {}ms", cacheKey, cost);
-            } else {
-                // 数据不存在，删除缓存
-                delete(cacheKey);
-                log.warn("数据不存在，删除缓存, key: {}", cacheKey);
-            }
-        } catch (Exception e) {
-            log.error("重建缓存任务失败, key: {}", cacheKey, e);
-        } finally {
-            releaseLock(lockKey, lockValue);
-        }
-    }
-
-    /**
-     * 反序列化 RedisData
-     */
-    private <T> T deserializeRedisData(String json, Class<T> clazz) {
-        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
-        Object dataObj = redisData.getData();
-        return JSONUtil.toBean(JSONUtil.parseObj(dataObj), clazz);
-    }
-
-    /**
-     * 保存带逻辑过期时间的缓存
-     *
-     * @param key   缓存键
-     * @param value 缓存值
-     * @param ttl   逻辑过期时间
-     */
-    public <T> void saveWithLogicalExpire(String key, T value, Duration ttl) {
-        validateKey(key);
-        Objects.requireNonNull(value, "value must not be null");
-        Objects.requireNonNull(ttl, "ttl must not be null");
-
-        try {
-            RedisData redisData = new RedisData();
-            redisData.setData(value);
-            redisData.setExpireTime(LocalDateTime.now().plus(ttl));
-
-            String json = JSONUtil.toJsonStr(redisData);
-            stringRedisTemplate.opsForValue().set(key, json);
-
-            log.debug("保存逻辑过期缓存成功, key: {}, expireTime: {}", key, redisData.getExpireTime());
-        } catch (Exception e) {
-            log.error("保存逻辑过期缓存失败, key: {}", key, e);
-            throw new CacheException("Failed to save cache with logical expire", e);
-        }
-    }
-
-    /**
-     * 预热缓存（逻辑过期方案）
-     *
-     * @param keyPrefix  key 前缀
-     * @param id         id
+     * @param keyPrefix  缓存key前缀
+     * @param id         数据id
      * @param ttl        逻辑过期时间
      * @param dbFallback 数据库查询函数
-     * @param <T>        返回类型
-     * @param <ID>       id 类型
      */
-    public <T, ID> void warmUpCache(
+    public <ID, T> void warmUpCache(
             String keyPrefix,
             ID id,
             Duration ttl,
-            Function<ID, T> dbFallback) {
-
-        Objects.requireNonNull(keyPrefix, "keyPrefix must not be null");
-        Objects.requireNonNull(id, "id must not be null");
-        Objects.requireNonNull(ttl, "ttl must not be null");
-        Objects.requireNonNull(dbFallback, "dbFallback must not be null");
+            Function<ID, T> dbFallback
+    ) {
+        // 参数校验
+        Objects.requireNonNull(keyPrefix);
+        Objects.requireNonNull(id);
+        Objects.requireNonNull(ttl);
+        Objects.requireNonNull(dbFallback);
 
         String key = buildKey(keyPrefix, id);
-        long startTime = System.currentTimeMillis();
+        LocalDateTime currentTime = LocalDateTime.now();
 
         try {
             T data = dbFallback.apply(id);
             if (data != null) {
                 saveWithLogicalExpire(key, data, ttl);
-                long cost = System.currentTimeMillis() - startTime;
-                log.info("预热缓存成功, key: {}, 耗时: {}ms", key, cost);
+                long cost = Duration.between(currentTime, LocalDateTime.now()).toMillis();
+                log.info("缓存预热成功，key：{}，耗时：{} ms", key, cost);
             } else {
-                log.warn("预热缓存失败，数据不存在, key: {}", key);
+                log.warn("缓存预热失败，数据库中不存在对应数据，key：{}", key);
             }
         } catch (Exception e) {
-            log.error("预热缓存异常, key: {}", key, e);
-            throw new CacheException("Failed to warm up cache", e);
+            log.error("缓存预热失败，key：{}", key, e);
+            throw new CacheException("缓存预热失败", e);
         }
     }
 
     /**
-     * 批量预热缓存
+     * 批量预热缓存（用于逻辑过期策略）
      *
-     * @param keyPrefix  key 前缀
-     * @param ids        id 列表
+     * @param keyPrefix  缓存key前缀
+     * @param ids        数据id集合
      * @param ttl        逻辑过期时间
      * @param dbFallback 数据库查询函数
-     * @param <T>        返回类型
-     * @param <ID>       id 类型
-     * @return 成功预热的数量
+     * @return 预热成功的数量
      */
-    public <T, ID> int batchWarmUpCache(
+    public <ID, T> int batchWarmUpCache(
             String keyPrefix,
-            java.util.Collection<ID> ids,
+            Collection<ID> ids,
             Duration ttl,
-            Function<ID, T> dbFallback) {
-
+            Function<ID, T> dbFallback
+    ) {
         if (ids == null || ids.isEmpty()) {
             return 0;
         }
@@ -736,169 +585,6 @@ public class CacheClient {
     }
 
     /**
-     * 尝试获取锁
-     *
-     * @param key   锁的 key
-     * @param value 锁的值（用于安全释放）
-     * @param ttl   锁的过期时间
-     * @return 是否获取成功
-     */
-    private boolean tryLock(String key, String value, Duration ttl) {
-        try {
-            Boolean result = stringRedisTemplate.opsForValue().setIfAbsent(
-                    key, value, ttl.toMillis(), TimeUnit.MILLISECONDS
-            );
-            return Boolean.TRUE.equals(result);
-        } catch (Exception e) {
-            log.error("获取锁失败, key: {}", key, e);
-            return false;
-        }
-    }
-
-    /**
-     * 释放锁（使用 Lua 脚本保证原子性）
-     *
-     * @param key   锁的 key
-     * @param value 锁的值
-     */
-    private void releaseLock(String key, String value) {
-        try {
-            stringRedisTemplate.execute(
-                    UNLOCK_SCRIPT,
-                    Collections.singletonList(key),
-                    value
-            );
-            log.debug("释放锁成功, key: {}", key);
-        } catch (Exception e) {
-            log.error("释放锁失败, key: {}", key, e);
-        }
-    }
-
-    /**
-     * 添加随机过期时间（防止缓存雪崩）
-     *
-     * @param baseDuration 基础过期时间
-     * @param randomFactor 随机因子（如 0.1 表示 ±10%）
-     * @return 带随机波动的过期时间
-     */
-    private Duration addRandomness(Duration baseDuration, double randomFactor) {
-        if (randomFactor <= 0) {
-            return baseDuration;
-        }
-        long baseMillis = baseDuration.toMillis();
-        long randomRange = (long) (baseMillis * randomFactor);
-        long randomMillis = (long) (Math.random() * randomRange * 2 - randomRange);
-        return Duration.ofMillis(baseMillis + randomMillis);
-    }
-
-    /**
-     * 生成锁的值（使用纳秒时间戳 + 线程ID）
-     */
-    private String generateLockValue() {
-        return System.nanoTime() + "-" + Thread.currentThread().getId();
-    }
-
-    /**
-     * 构建缓存键
-     */
-    private <ID> String buildKey(String prefix, ID id) {
-        return prefix + id;
-    }
-
-    /**
-     * 从缓存获取数据
-     */
-    private <T> T getFromCache(String key, Class<T> clazz) {
-        try {
-            String json = stringRedisTemplate.opsForValue().get(key);
-            if (StrUtil.isNotBlank(json)) {
-                return deserialize(json, clazz);
-            }
-            // 空值缓存判断
-            if (json != null) {
-                return null;
-            }
-        } catch (Exception e) {
-            log.error("从缓存获取数据失败, key: {}", key, e);
-        }
-        return null;
-    }
-
-    /**
-     * 缓存空值
-     */
-    private void cacheNullValue(String key, Duration ttl) {
-        try {
-            stringRedisTemplate.opsForValue().set(key, "", ttl);
-            log.debug("缓存空值, key: {}", key);
-        } catch (Exception e) {
-            log.error("缓存空值失败, key: {}", key, e);
-        }
-    }
-
-    /**
-     * 执行数据库查询（带异常处理）
-     */
-    private <T, ID> T executeWithFallback(Function<ID, T> dbFallback, ID id, String key) {
-        try {
-            return dbFallback.apply(id);
-        } catch (Exception e) {
-            log.error("查询数据库失败, key: {}, id: {}", key, id, e);
-            throw new CacheException("Database query failed", e);
-        }
-    }
-
-    /**
-     * 反序列化 JSON
-     */
-    private <T> T deserialize(String json, Class<T> clazz) {
-        try {
-            return JSONUtil.toBean(json, clazz);
-        } catch (Exception e) {
-            log.error("反序列化失败, json: {}, class: {}", json, clazz.getName(), e);
-            return null;
-        }
-    }
-
-    /**
-     * 参数校验
-     */
-    private <T, ID> void validateParams(String keyPrefix, ID id, Class<T> clazz, Duration ttl, Function<ID, T> dbFallback) {
-        Objects.requireNonNull(keyPrefix, "keyPrefix must not be null");
-        Objects.requireNonNull(id, "id must not be null");
-        Objects.requireNonNull(clazz, "clazz must not be null");
-        Objects.requireNonNull(ttl, "ttl must not be null");
-        Objects.requireNonNull(dbFallback, "dbFallback must not be null");
-    }
-
-    /**
-     * 键校验
-     */
-    private void validateKey(String key) {
-        if (StrUtil.isBlank(key)) {
-            throw new IllegalArgumentException("key must not be blank");
-        }
-    }
-
-    /**
-     * 记录缓存命中日志
-     */
-    private void logCacheHit(String key, long startTime) {
-        long cost = System.currentTimeMillis() - startTime;
-        log.debug("缓存命中, key: {}, 耗时: {}ms", key, cost);
-    }
-
-    /**
-     * 记录缓存未命中日志
-     */
-    private void logCacheMiss(String key, long startTime) {
-        long cost = System.currentTimeMillis() - startTime;
-        log.debug("缓存未命中, key: {}, 耗时: {}ms", key, cost);
-    }
-
-    // ==================== 自定义异常 ====================
-
-    /**
      * 缓存异常
      */
     public static class CacheException extends RuntimeException {
@@ -908,6 +594,51 @@ public class CacheClient {
 
         public CacheException(String message, Throwable cause) {
             super(message, cause);
+        }
+    }
+
+    /**
+     * 删除缓存
+     *
+     * @param key 缓存key
+     * @return 删除是否成功
+     */
+    public boolean delete(String key) {
+        validateKey(key);
+
+        try {
+            return stringRedisTemplate.delete(key);
+        } catch (Exception e) {
+            log.error("缓存删除失败，key：{}", key, e);
+            return false;
+        }
+    }
+
+    /**
+     * 批量删除缓存
+     *
+     * @param keys 缓存key数组
+     * @return 删除的数量
+     */
+    public long deleteBatch(String... keys) {
+        if (keys == null || keys.length == 0) {
+            return 0;
+        }
+
+        try {
+            return stringRedisTemplate.delete(Arrays.asList(keys));
+        } catch (Exception e) {
+            log.error("批量缓存删除失败", e);
+            return 0;
+        }
+    }
+
+    /**
+     * 校验 key 是否为空
+     */
+    private void validateKey(String key) {
+        if (StrUtil.isBlank(key)) {
+            throw new IllegalArgumentException("Key 必须不能为空");
         }
     }
 }

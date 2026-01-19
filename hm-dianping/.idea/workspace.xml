@@ -6,7 +6,9 @@
   <component name="ChangeListManager">
     <list default="true" id="d82d0624-8819-4c5b-ac81-016882793e03" name="更改" comment="feat: 实现了“根据 id 查询店铺信息”的逻辑">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/utils/CacheClient.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/utils/CacheClient.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/service/impl/ShopServiceImpl.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/service/impl/ShopServiceImpl.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/service/impl/ShopTypeServiceImpl.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/service/impl/ShopTypeServiceImpl.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/utils/CacheClient.java" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/target/classes/com/hmdp/service/impl/ShopServiceImpl.class" beforeDir="false" afterPath="$PROJECT_DIR$/target/classes/com/hmdp/service/impl/ShopServiceImpl.class" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -124,7 +126,7 @@
       <workItem from="1768756804454" duration="20000" />
       <workItem from="1768756839398" duration="20399000" />
       <workItem from="1768842573068" duration="588000" />
-      <workItem from="1768843322667" duration="4825000" />
+      <workItem from="1768843322667" duration="7313000" />
     </task>
     <task id="LOCAL-00001" summary="feat: 实现了“根据 id 查询店铺信息”的逻辑">
       <option name="closed" value="true" />

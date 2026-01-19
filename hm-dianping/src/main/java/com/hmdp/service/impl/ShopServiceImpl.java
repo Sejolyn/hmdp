@@ -8,7 +8,6 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisConstants;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -118,10 +117,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         updateById(shop);
 
         // 2. 删除缓存（双写一致性策略：先更新数据库，再删除缓存）
-        String cacheKey = RedisConstants.CACHE_SHOP_KEY + id;
+        String cacheKey = getShopCacheKey(id);
         boolean deleted = cacheClient.delete(cacheKey);
         
-        log.info("更新商铺成功，已删除缓存，商铺ID: {}", id);
+        log.info("更新商铺成功，已删除缓存，商铺ID: {}, 是否删除成功: {}", id, deleted);
         
         // 3. 如果使用逻辑过期策略，可以选择立即预热缓存
         // warmUpShopCache(id);
