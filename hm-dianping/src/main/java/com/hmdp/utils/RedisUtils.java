@@ -17,4 +17,8 @@ public class RedisUtils {
         return RedisConstants.CACHE_SHOP_KEY + id;
     }
 
+    public static String getShopLockKey(Long id) {
+        return RedisConstants.LOCK_SHOP_KEY + id;
+    }
+
 }

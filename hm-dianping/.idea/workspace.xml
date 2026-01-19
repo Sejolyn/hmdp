@@ -72,7 +72,7 @@
     "project.structure.last.edited": "项目",
     "project.structure.proportion": "0.0",
     "project.structure.side.proportion": "0.2",
-    "settings.editor.selected.configurable": "configurable.group.appearance",
+    "settings.editor.selected.configurable": "preferences.keymap",
     "vue.rearranger.settings.migration": "true"
   },
   "keyToStringList": {
@@ -118,7 +118,7 @@
       <workItem from="1768756717317" duration="5000" />
       <workItem from="1768756772147" duration="23000" />
       <workItem from="1768756804454" duration="20000" />
-      <workItem from="1768756839398" duration="9454000" />
+      <workItem from="1768756839398" duration="11859000" />
     </task>
     <task id="LOCAL-00001" summary="feat: 实现了“根据 id 查询店铺信息”的逻辑">
       <option name="closed" value="true" />
