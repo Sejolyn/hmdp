@@ -187,8 +187,7 @@ public class CacheClient {
      * 获取线程池状态（用于监控）
      */
     public String getThreadPoolStatus() {
-        if (cacheRebuildExecutor instanceof ThreadPoolExecutor) {
-            ThreadPoolExecutor executor = (ThreadPoolExecutor) cacheRebuildExecutor;
+        if (cacheRebuildExecutor instanceof ThreadPoolExecutor executor) {
             return String.format(
                     "活跃线程: %d, 池大小: %d, 队列大小: %d, 完成任务: %d",
                     executor.getActiveCount(),
