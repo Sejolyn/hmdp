@@ -4,12 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="d82d0624-8819-4c5b-ac81-016882793e03" name="更改" comment="">
-      <change afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/config/MvcConfig.java" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/utils/LoginInterceptor.java" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/utils/RedisUtils.java" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/utils/RefreshTokenInterceptor.java" afterDir="false" />
-    </list>
+    <list default="true" id="d82d0624-8819-4c5b-ac81-016882793e03" name="更改" comment="feat: 实现了“根据 id 查询店铺信息”的逻辑" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -123,11 +118,25 @@
       <workItem from="1768756717317" duration="5000" />
       <workItem from="1768756772147" duration="23000" />
       <workItem from="1768756804454" duration="20000" />
+      <workItem from="1768756839398" duration="5864000" />
     </task>
+    <task id="LOCAL-00001" summary="feat: 实现了“根据 id 查询店铺信息”的逻辑">
+      <option name="closed" value="true" />
+      <created>1768824369274</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1768824369274</updated>
+    </task>
+    <option name="localTasksCounter" value="2" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="feat: 实现了“根据 id 查询店铺信息”的逻辑" />
+    <option name="LAST_COMMIT_MESSAGE" value="feat: 实现了“根据 id 查询店铺信息”的逻辑" />
   </component>
   <component name="github-copilot-workspace">
     <instructionFileLocations>

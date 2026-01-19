@@ -13,4 +13,8 @@ public class RedisUtils {
         return RedisConstants.LOGIN_CODE_KEY + phone;
     }
 
+    public static String getShopCacheKey(Long id) {
+        return RedisConstants.CACHE_SHOP_KEY + id;
+    }
+
 }
