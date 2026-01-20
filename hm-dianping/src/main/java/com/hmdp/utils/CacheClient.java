@@ -392,7 +392,6 @@ public class CacheClient {
                 // 如果缓存已经被更新（未过期），刷新逻辑过期时间，然后返回
                 if (redisData.getExpireTime().isAfter(LocalDateTime.now())) {
                     // 更新逻辑过期时间
-                    data = JSONUtil.toBean(JSONUtil.toJsonStr(redisData.getData()), clazz);
                     saveWithLogicalExpire(key, data, ttl);
                     unlock(lockKey, lockId); // 释放锁
                     return data;
