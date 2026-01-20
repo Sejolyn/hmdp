@@ -18,10 +18,4 @@ import org.springframework.stereotype.Service;
 @Service
 public class SeckillVoucherServiceImpl extends ServiceImpl<SeckillVoucherMapper, SeckillVoucher> implements ISeckillVoucherService {
 
-
-
-    @Override
-    public Result seckillVoucher(Long voucherId) {
-        // 1. 获取秒杀卷
-    }
 }

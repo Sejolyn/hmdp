@@ -8,8 +8,10 @@
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/controller/VoucherOrderController.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/controller/VoucherOrderController.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/service/ISeckillVoucherService.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/service/ISeckillVoucherService.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/service/IVoucherOrderService.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/service/IVoucherOrderService.java" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/service/impl/SeckillVoucherServiceImpl.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/service/impl/SeckillVoucherServiceImpl.java" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/target/classes/application.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/target/classes/application.yaml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/service/impl/VoucherOrderServiceImpl.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/service/impl/VoucherOrderServiceImpl.java" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/main/java/com/hmdp/utils/IdGenerator.java" beforeDir="false" afterPath="$PROJECT_DIR$/src/main/java/com/hmdp/utils/IdGenerator.java" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -128,7 +130,7 @@
       <workItem from="1768756839398" duration="20399000" />
       <workItem from="1768842573068" duration="588000" />
       <workItem from="1768843322667" duration="7581000" />
-      <workItem from="1768912791718" duration="7590000" />
+      <workItem from="1768912791718" duration="9007000" />
     </task>
     <task id="LOCAL-00001" summary="feat: 实现了“根据 id 查询店铺信息”的逻辑">
       <option name="closed" value="true" />
