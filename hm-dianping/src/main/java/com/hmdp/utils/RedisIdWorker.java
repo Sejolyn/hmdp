@@ -19,7 +19,7 @@ import java.time.ZoneOffset;
  */
 @Slf4j
 @Component
-public class IdGenerator {
+public class RedisIdWorker {
 
     /**
      * 开始时间：2026-01-20 00:00:00（UTC时间戳）
@@ -34,7 +34,7 @@ public class IdGenerator {
 
     private final StringRedisTemplate stringRedisTemplate;
 
-    public IdGenerator(StringRedisTemplate stringRedisTemplate) {
+    public RedisIdWorker(StringRedisTemplate stringRedisTemplate) {
         this.stringRedisTemplate = stringRedisTemplate;
     }
 
